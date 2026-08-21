@@ -546,13 +546,8 @@ uint obj_id:register(b0);
     CodegenVertex(vertFunc, codegenData, nonEmptyCbuffer || enable_debug_info);
     opt->appdataId = -1;
     codegenData << "#elif defined(PS)\n"sv;
-    size_t vert_arg_offset = 0;
-    for (auto &i : vert_args.subspan(1)) {
-        if (detail::IsCBuffer(i.tag())) {
-            vert_arg_offset += 1;
-        }
-    }
-    opt->argOffset = vert_arg_offset;
+    // Pixel argument UIDs follow every vertex argument, including resources.
+    opt->argOffset = vert_args.size() - 1u;
     CodegenPixel(pixelFunc, codegenData, nonEmptyCbuffer);
     codegenData << "#endif\n"sv;
 

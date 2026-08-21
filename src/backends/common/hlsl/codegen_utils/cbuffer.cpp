@@ -73,9 +73,11 @@ void CodegenUtility::GenerateCBuffer(
     size_t struct_size = 0;
     size_t func_idx = 0;
     for (auto &&f : fs) {
-        size_t size_cache = 0;
+        size_t argument_count = 0;
         Type const *last_type = nullptr;
         for (auto &&i : *f) {
+            // Resource arguments still occupy variable UIDs between shader stages.
+            argument_count++;
             if (!detail::IsCBuffer(i.tag())) {
                 if (generate_debug_info && detail::IsValidateResource(i.tag())) {
                     if (func_idx < func_hashes.size()) {
@@ -85,7 +87,6 @@ void CodegenUtility::GenerateCBuffer(
                     ++validation_count;
                 }
             } else {
-                size_cache++;
                 StructGenerator::ProvideAlignVariable(last_type, i.type()->alignment(), align, struct_size, result);
                 if (last_type && (StructGenerator::half_type_adjacent_with_bool(last_type, i.type()) ||
                                   StructGenerator::half_type_adjacent_with_bool(i.type(), last_type))) [[unlikely]] {
@@ -123,7 +124,7 @@ void CodegenUtility::GenerateCBuffer(
                 }
             }
         }
-        size += size_cache;
+        size += argument_count;
         ++func_idx;
     }
     // generate _validate_* variable in kernel
