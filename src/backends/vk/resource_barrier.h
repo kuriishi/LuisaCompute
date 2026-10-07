@@ -9,6 +9,7 @@ class BindlessArray;
 class Buffer;
 class ResourceBarrier {
 public:
+    uint64_t profile_command{};
     struct Range {
         int64_t min;
         int64_t max;

@@ -15,6 +15,7 @@
 #include "shader.h"
 #include "resource_barrier.h"
 #include "command_buffer_ownership.h"
+#include "profile.h"
 
 namespace lc::vk {
 class Event;
@@ -62,6 +63,7 @@ public:
 };
 }// namespace temp_buffer
 struct CommandBufferState {
+    std::shared_ptr<ProfileQueries> profile_queries;
     VkCommandPool pool{};
     Device *device{};
     temp_buffer::BufferAllocator<UploadBuffer> upload_alloc;

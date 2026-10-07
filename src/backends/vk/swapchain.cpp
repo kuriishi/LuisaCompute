@@ -928,9 +928,12 @@ void Swapchain::present(
     uint mip) {
     fence = nullptr;
     image_index = 0u;
+    auto fence_scope = luisa::compute::profile::Scope{"present.frame_fence_wait"};
     VK_CHECK_RESULT(vkWaitForFences(
         device()->logic_device(), 1, &_in_flight_fences[_current_frame],
         VK_TRUE, UINT64_MAX));
+    fence_scope.finish();
+    auto acquire_scope = luisa::compute::profile::Scope{"present.acquire"};
     if (auto ret = vkAcquireNextImageKHR(
             device()->logic_device(), _swapchain, UINT64_MAX,
             _image_available_semaphores[_current_frame],
@@ -943,6 +946,7 @@ void Swapchain::present(
             "Failed to acquire swapchain image: {}.",
             luisa::to_string(ret));
     }
+    acquire_scope.finish();
     VK_CHECK_RESULT(vkResetFences(device()->logic_device(), 1, &_in_flight_fences[_current_frame]));
     // Create vertex buffer only after successful acquisition
     if (!_vertex_buffer) {

@@ -1350,6 +1350,10 @@ CommandBufferState::~CommandBufferState() {
     vkDestroyDescriptorPool(device->logic_device(), desc_pool, Device::alloc_callbacks());
 }
 void CommandBufferState::reset(Stream *stream, Device &device) {
+    if (profile_queries) {
+        profile_queries->collect();
+        profile_queries.reset();
+    }
     for (auto &i : callbacks) {
         i();
     }
@@ -1503,6 +1507,10 @@ void Stream::present(
         cmdbuffer.scratch_buffer_alloc = &_scratch_buffer_alloc;
         cmdbuffer.begin();
         PresentCommand present_cmd;
+        if (auto s = luisa::compute::profile::sink(); s && s->enabled() && s->wants_metric("gpu.timestamps")) {
+            cmdbuffer.states()->profile_queries = std::make_shared<ProfileQueries>(device(), *this, cmdbuffer.cmdbuffer(), 4);
+            cmdbuffer.states()->profile_queries->begin("present.gpu", s->parent());
+        }
         present_cmd.submit_wait_semaphores.emplace_back();
         present_cmd.signal_semaphores.emplace_back();
         present_cmd.wait_stages.emplace_back();
@@ -1519,11 +1527,13 @@ void Stream::present(
             vk_fence,
             mip);
 
+        if (cmdbuffer.states()->profile_queries) { cmdbuffer.states()->profile_queries->end(); }
         _resource_barrier.restore_states(cmdbuffer.cmdbuffer());
         cmdbuffer.end();
 
         // If fence is null, swapchain was recreated and we should skip this frame
         if (vk_fence == nullptr) {
+            cmdbuffer.states()->profile_queries.reset();
             // Cleanup command buffer without submitting
             cmdbuffer.states()->reset(this, *device());
             // Update fence and enqueue notification to match normal completion path
@@ -1596,7 +1606,9 @@ void Stream::present(
             present_info.pWaitSemaphores = present_cmd.present_wait_semaphores.data();
             present_info.pImageIndices = present_cmd.image_indices.data();
             _queue_mtx->lock();
-            auto result = vkQueuePresentKHR(_queue, &present_info);
+        auto present_scope = luisa::compute::profile::Scope{"present.api", 0, reinterpret_cast<uint64_t>(_queue)};
+        auto result = vkQueuePresentKHR(_queue, &present_info);
+        present_scope.finish();
             _queue_mtx->unlock();
             if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
                 swapchain->handle_present_error();
@@ -1744,7 +1756,9 @@ void Stream::dispatch(
             present_info.pWaitSemaphores = present_cmd.present_wait_semaphores.data();
             present_info.pImageIndices = present_cmd.image_indices.data();
             _queue_mtx->lock();
+            auto present_scope = luisa::compute::profile::Scope{"present.api", 0, reinterpret_cast<uint64_t>(_queue)};
             auto result = vkQueuePresentKHR(_queue, &present_info);
+            present_scope.finish();
             _queue_mtx->unlock();
             if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
                 for (auto &i : presents) {
@@ -1798,7 +1812,9 @@ void Stream::dispatch(
                 present_info.pWaitSemaphores = present_cmd.present_wait_semaphores.data();
                 present_info.pImageIndices = present_cmd.image_indices.data();
                 _queue_mtx->lock();
+                auto present_scope = luisa::compute::profile::Scope{"present.api", 0, reinterpret_cast<uint64_t>(_queue)};
                 auto result = vkQueuePresentKHR(_queue, &present_info);
+                present_scope.finish();
                 _queue_mtx->unlock();
                 if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
                     // Only handle present errors for the successfully presented prefix
@@ -2365,6 +2381,13 @@ void Stream::wait(Event *event, uint64_t value) {
     event->_wait(*this, value);
 }
 void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
+    auto profile_observer = luisa::compute::profile::sink();
+    auto profiling = profile_observer && profile_observer->enabled();
+    auto gpu_profiling = profiling && profile_observer->wants_metric("gpu.timestamps");
+    luisa::compute::profile::Scope encoding_scope{"backend.encode", 0, reinterpret_cast<uint64_t>(_stream.queue()), reinterpret_cast<uint64_t>(_cmdbuffer)};
+    if (gpu_profiling) {
+        _state->profile_queries = std::make_shared<ProfileQueries>(device(), _stream, _cmdbuffer, static_cast<uint32_t>(cmds.size() * 4 + 8));
+    }
     // collect argument buffer
     const auto argument_buffer_alignment = std::max<size_t>(
         32u, device()->properties().limits.minStorageBufferOffsetAlignment);
@@ -2385,6 +2408,7 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
                     planned_argument_buffer_layout.status()));
         }
     };
+    auto reorder_scope = luisa::compute::profile::Scope{"backend.reorder"};
     for (auto &&command : cmds) {
         if (command->tag() == Command::Tag::EShaderDispatchCommand) {
             auto c = static_cast<ShaderDispatchCommand const *>(command.get());
@@ -2429,6 +2453,7 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
     const auto uniform_buffer_size =
         planned_argument_buffer_layout.size();
     auto cmd_lists = _stream.reorder.command_lists();
+    reorder_scope.finish();
     auto clear_reorder = vstd::scope_exit([&] {
         _stream.reorder.clear();
     });
@@ -2593,7 +2618,9 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
         dispatch_offsets->emplace_back(
             block_offset, emitted_layout.size());
     };
+    auto profile_layer = uint64_t{0};
     for (auto &&lst : cmd_lists) {
+        ++profile_layer;
         dispatch_offsets->clear();
         auto delay_clear = vstd::scope_exit([&]() {
             scratch_buffer_alloc->clear();
@@ -2601,6 +2628,7 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
         // Preprocess: record resources' states
         for (auto i = lst; i != nullptr; i = i->p_next) {
             auto cmd = i->cmd;
+            resource_barrier->profile_command = profiling ? cmd->profile_id() : 0;
             switch (cmd->tag()) {
                 case Command::Tag::EBufferUploadCommand: {
                     auto c = static_cast<BufferUploadCommand const *>(cmd);
@@ -3170,10 +3198,18 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
         };
         struct PendingCopy {
             vstd::unordered_map<BufferPair, vstd::vector<VkBufferCopy2>> copies;
+            vstd::vector<uint64_t> profile_members;
         };
         PendingCopy pending_upload;
         PendingCopy pending_download;
         auto flush_pending_upload = [&]() {
+            if (profiling && !pending_upload.copies.empty()) {
+                auto batch = profile_observer->next_id();
+                for (auto member : pending_upload.profile_members) {
+                    luisa::compute::profile::emit({"batch_member", "upload", member, batch});
+                }
+                if (gpu_profiling) { _state->profile_queries->begin("copy.upload_batch", batch); }
+            }
             for (auto &[buffer_pair, regions] : pending_upload.copies) {
                 if (regions.empty()) continue;
                 VkCopyBufferInfo2 copy_info2{
@@ -3185,9 +3221,18 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
                     regions.data()};
                 vkCmdCopyBuffer2(_cmdbuffer, &copy_info2);
             }
+            if (gpu_profiling && !pending_upload.copies.empty()) { _state->profile_queries->end(); }
             pending_upload.copies.clear();
+            pending_upload.profile_members.clear();
         };
         auto flush_pending_download = [&]() {
+            if (profiling && !pending_download.copies.empty()) {
+                auto batch = profile_observer->next_id();
+                for (auto member : pending_download.profile_members) {
+                    luisa::compute::profile::emit({"batch_member", "download", member, batch});
+                }
+                if (gpu_profiling) { _state->profile_queries->begin("copy.download_batch", batch); }
+            }
             for (auto &[buffer_pair, regions] : pending_download.copies) {
                 if (regions.empty()) continue;
                 VkCopyBufferInfo2 copy_info2{
@@ -3199,7 +3244,9 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
                     regions.data()};
                 vkCmdCopyBuffer2(_cmdbuffer, &copy_info2);
             }
+            if (gpu_profiling && !pending_download.copies.empty()) { _state->profile_queries->end(); }
             pending_download.copies.clear();
+            pending_download.profile_members.clear();
         };
         auto flush_all_pending = [&]() {
             flush_pending_upload();
@@ -3209,10 +3256,40 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
         // Post process: actual start record command to commandbuffer
         for (auto i = lst; i != nullptr; i = i->p_next) {
             auto cmd = i->cmd;
+            resource_barrier->profile_command = profiling ? cmd->profile_id() : 0;
+            auto transfer_batch = cmd->tag() == Command::Tag::EBufferUploadCommand || cmd->tag() == Command::Tag::EBufferDownloadCommand;
+            auto command_scope = luisa::compute::profile::Scope{"backend.command_encode", cmd->profile_id(), reinterpret_cast<uint64_t>(_stream.queue())};
+            if (profiling) {
+                auto shader = cmd->tag() == Command::Tag::EShaderDispatchCommand ? static_cast<ShaderDispatchCommand const *>(cmd) : nullptr;
+                luisa::compute::profile::emit({"encoded", "command", cmd->profile_id(), 0,
+                    reinterpret_cast<uint64_t>(_stream.queue()), reinterpret_cast<uint64_t>(_cmdbuffer), profile_layer,
+                    luisa::compute::profile::clock_ns(), 0, static_cast<double>(cmd->tag())});
+                if (shader) {
+                    luisa::compute::profile::emit({"shader", "dispatch", cmd->profile_id(), 0, 0, shader->handle()});
+                    if (!shader->is_indirect() && !shader->is_multiple_dispatch() &&
+                        reinterpret_cast<Shader const *>(shader->handle())->shader_tag() == Shader::ShaderTag::kComputeShader) {
+                        auto size = shader->dispatch_size();
+                        auto block = reinterpret_cast<ComputeShader const *>(shader->handle())->block_size();
+                        luisa::compute::profile::emit({"work", "dispatch.extent", cmd->profile_id(), 0, 0,
+                            size.x, size.y, size.z, 0, static_cast<double>(size.x) * size.y * size.z});
+                        luisa::compute::profile::emit({"work", "block.extent", cmd->profile_id(), 0, 0,
+                            block.x, block.y, block.z});
+                    }
+                }
+                // Upload/download commands are batched by the backend; never flush them merely for profiling.
+                if (gpu_profiling && !transfer_batch) {
+                    if (cmd->tag() != Command::Tag::ECurveBuildCommand) { flush_all_pending(); }
+                    _state->profile_queries->begin("command", cmd->profile_id());
+                }
+            }
             switch (cmd->tag()) {
                 case Command::Tag::EBufferUploadCommand: {
                     auto c = static_cast<BufferUploadCommand const *>(cmd);
                     auto chunk = _state->upload_alloc.allocate(c->size(), 16);
+                    if (profiling) {
+                        pending_upload.profile_members.emplace_back(c->profile_id());
+                        luisa::compute::profile::emit({"work", "copy.bytes", c->profile_id(), 0, 0, 0, c->size()});
+                    }
                     static_cast<UploadBuffer const *>(chunk.buffer)->copy_from(c->data(), chunk.offset, c->size());
                     VkBuffer src = chunk.buffer->vk_buffer();
                     VkBuffer dst = reinterpret_cast<Buffer const *>(c->handle())->vk_buffer();
@@ -3226,7 +3303,12 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
                 case Command::Tag::EBufferDownloadCommand: {
                     auto c = static_cast<BufferDownloadCommand const *>(cmd);
                     auto chunk = _state->readback_alloc.allocate(c->size(), 16);
-                    _state->callbacks.emplace_back([chunk, data = c->data(), size = c->size()]() {
+                    if (profiling) {
+                        pending_download.profile_members.emplace_back(c->profile_id());
+                        luisa::compute::profile::emit({"work", "copy.bytes", c->profile_id(), 0, 0, 0, c->size()});
+                    }
+                    _state->callbacks.emplace_back([chunk, data = c->data(), size = c->size(), profile_id = c->profile_id()]() {
+                        auto scope = luisa::compute::profile::Scope{"readback.host_memcpy", profile_id, 0, 0, size};
                         static_cast<ReadbackBuffer const *>(chunk.buffer)->copy_to(data, chunk.offset, size);
                     });
                     VkBuffer src = reinterpret_cast<Buffer const *>(c->handle())->vk_buffer();
@@ -4095,6 +4177,7 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
                 } break;
                 default: break;
             }
+            if (gpu_profiling && !transfer_batch) { _state->profile_queries->end(); }
         }
         LUISA_ASSERT(
             dispatch_offset_index == dispatch_offsets->size(),
@@ -4102,6 +4185,7 @@ void CommandBuffer::execute(vstd::span<const luisa::unique_ptr<Command>> cmds) {
             "preprocessing produced {}.",
             dispatch_offset_index, dispatch_offsets->size());
         flush_all_pending();
+        resource_barrier->profile_command = 0;
     }
     LUISA_ASSERT(
         preprocessed_argument_buffer_layout.size() ==

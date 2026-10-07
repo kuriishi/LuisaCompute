@@ -1,6 +1,7 @@
 #include <luisa/core/logging.h>
 
 #include "resource_barrier.h"
+#include "profile.h"
 #include "resource_barrier_contract.h"
 #include "bindless_array.h"
 
@@ -219,6 +220,23 @@ void ResourceBarrier::_record(
     VkAccessFlagBits2 access,
     VkImageLayout layout,
     detail::TextureLayoutContract layout_contract) {
+    if (auto s = luisa::compute::profile::sink(); profile_command && s && s->enabled()) {
+        constexpr auto writes = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_HOST_WRITE_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT |
+            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        if (res.is_type_of<BufferView>()) {
+            auto const &view = res.get<0>();
+            s->record({"access", "buffer", s->next_id(), profile_command, 0,
+                reinterpret_cast<uint64_t>(view.buffer->vk_buffer()), static_cast<uint64_t>(access),
+                view.offset, view.offset + view.size_bytes, (access & writes) ? 1.0 : 0.0});
+        } else {
+            auto const &view = res.get<1>();
+            s->record({"access", "image", s->next_id(), profile_command, 0,
+                reinterpret_cast<uint64_t>(view.tex->vk_image()), static_cast<uint64_t>(access),
+                view.level, view.level + 1u, (access & writes) ? 1.0 : 0.0});
+        }
+    }
     if (res.is_type_of<BufferView>()) {
         auto &buffer_view = res.get<0>();
         // If the buffer is host-visible, should not be recorded by resource-barrier
@@ -709,6 +727,8 @@ void ResourceBarrier::update_states(VkCommandBuffer cmd_buffer) {
         info.bufferMemoryBarrierCount = _buffer_barriers.size();
         info.pBufferMemoryBarriers = _buffer_barriers.data();
     }
+    profile_barriers(cmd_buffer, info);
+    auto profile_scope = luisa::compute::profile::Scope{"barrier.encode"};
     vkCmdPipelineBarrier2(cmd_buffer, &info);
 }
 
@@ -784,6 +804,8 @@ void ResourceBarrier::restore_states(VkCommandBuffer cmd_buffer) {
         info.bufferMemoryBarrierCount = _buffer_barriers.size();
         info.pBufferMemoryBarriers = _buffer_barriers.data();
     }
+    profile_barriers(cmd_buffer, info);
+    auto profile_scope = luisa::compute::profile::Scope{"barrier.restore_encode"};
     vkCmdPipelineBarrier2(cmd_buffer, &info);
     _buffer_frame_states.clear();
     _texture_frame_states.clear();

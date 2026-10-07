@@ -940,6 +940,13 @@ void Device::_init_device(VkPhysicalDevice external_physical_device, VkDevice ex
         }
     };
     auto api_version = _vk_device->properties.apiVersion;
+    luisa::compute::profile::emit({"capability", "gpu.device", 0, 0, 0,
+        _vk_device->properties.vendorID, _vk_device->properties.deviceID, api_version, 0,
+        static_cast<double>(_vk_device->properties.driverVersion), _vk_device->properties.deviceName});
+    if (luisa::compute::profile::sink() && external_device == VK_NULL_HANDLE &&
+        supports_device_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+        enable_device_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+    }
     auto has_core_timeline_semaphore = api_version >= VK_API_VERSION_1_2;
     auto has_core_synchronization2 = api_version >= VK_API_VERSION_1_3;
     auto has_physical_device_api_1_3 =
@@ -3171,7 +3178,9 @@ void Device::wait_event(uint64_t handle, uint64_t stream_handle, uint64_t fence_
 void Device::synchronize_event(uint64_t handle, uint64_t fence_value) noexcept {
     reinterpret_cast<Event *>(handle)->sync(fence_value);
 }
-void Device::set_name(luisa::compute::Resource::Tag resource_tag, uint64_t resource_handle, luisa::string_view name) noexcept {}
+void Device::set_name(luisa::compute::Resource::Tag resource_tag, uint64_t resource_handle, luisa::string_view name) noexcept {
+    luisa::compute::profile::emit({"name", name, 0, 0, 0, resource_handle, static_cast<uint64_t>(resource_tag)});
+}
 bool Device::is_event_completed(uint64_t handle, uint64_t fence_value) const noexcept {
     return reinterpret_cast<Event *>(handle)->is_complete(fence_value);
 }

@@ -88,6 +88,8 @@ void Event::_signal_sparse(
     sparse_info->pSignalSemaphores = &_semaphore;
 }
 void Event::_signal(Stream &stream, uint64_t value, VkCommandBuffer *cmdbuffer) {
+    auto queue_id = reinterpret_cast<uint64_t>(stream.queue());
+    auto signal_scope = luisa::compute::profile::Scope{"queue.signal", 0, queue_id, reinterpret_cast<uint64_t>(_semaphore), value};
     std::lock_guard submission_lock{_submission_mtx};
     auto tracked_signal = last_signaled_fence();
     auto current_value = known_completed_gpu_fence();
@@ -127,7 +129,10 @@ void Event::_signal(Stream &stream, uint64_t value, VkCommandBuffer *cmdbuffer) 
     info1.commandBufferCount = cmdbuffer ? 1 : 0;
     info1.pCommandBuffers = cmdbuffer;
     {
+        auto lock_scope = luisa::compute::profile::Scope{"queue.lock", 0, queue_id};
         std::lock_guard queue_lock{stream.queue_mtx()};
+        lock_scope.finish();
+        auto submit_scope = luisa::compute::profile::Scope{"queue.submit", 0, queue_id, cmdbuffer ? reinterpret_cast<uint64_t>(*cmdbuffer) : 0, value};
         auto config_ext = device()->config_ext();
         if (!(config_ext && config_ext->signal_semaphore(
                                 stream.queue(), _semaphore, value))) {
@@ -139,6 +144,7 @@ void Event::_signal(Stream &stream, uint64_t value, VkCommandBuffer *cmdbuffer) 
     mark_signal_fence(value);
 }
 void Event::_wait(Stream &stream, uint64_t value) {
+    auto wait_scope = luisa::compute::profile::Scope{"queue.wait_dependency", 0, reinterpret_cast<uint64_t>(stream.queue()), reinterpret_cast<uint64_t>(_semaphore), value};
     std::lock_guard submission_lock{_submission_mtx};
     auto tracked_signal = last_signaled_fence();
     auto current_value = known_completed_gpu_fence();
@@ -191,6 +197,7 @@ void Event::_wait(Stream &stream, uint64_t value) {
     }
 }
 void Event::_host_wait(uint64_t value) {
+    auto wait_scope = luisa::compute::profile::Scope{"completion.device_wait", 0, 0, reinterpret_cast<uint64_t>(_semaphore), value};
     if (device()->config_ext() && device()->config_ext()->sync_semaphore(_semaphore, value)) {
         _mark_gpu_completion(value);
         return;
@@ -204,12 +211,17 @@ void Event::_host_wait(uint64_t value) {
     _mark_gpu_completion(value);
 }
 void Event::_notify(uint64_t value) {
+    auto notify_scope = luisa::compute::profile::Scope{"completion.notify", 0, 0, reinterpret_cast<uint64_t>(_semaphore), value};
     {
         std::lock_guard lck(_event_mtx);
+        // Publish completion only after the observer is done: sync() may let
+        // the owner destroy the observer as soon as this value becomes visible.
+        notify_scope.finish();
         _finished_event = std::max<uint64_t>(_finished_event, value);
     }
 }
 void Event::sync(uint64_t value) {
+    auto wait_scope = luisa::compute::profile::Scope{"synchronize.host_wait", 0, 0, reinterpret_cast<uint64_t>(_semaphore), value};
     while (_finished_event < value) {
         std::this_thread::yield();
     }

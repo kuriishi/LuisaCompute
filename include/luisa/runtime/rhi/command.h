@@ -1,6 +1,7 @@
 #pragma once
 
 #include <limits>
+#include <luisa/runtime/profile.h>
 
 #include <luisa/core/macro.h>
 #include <luisa/core/basic_types.h>
@@ -91,9 +92,11 @@ public:
 
 private:
     Tag _tag;
+    uint64_t _profile_id;
 
 public:
-    explicit Command(Tag tag) noexcept : _tag(tag) {}
+    explicit Command(Tag tag) noexcept : _tag(tag), _profile_id(profile::command_created(static_cast<uint32_t>(tag))) {}
+    [[nodiscard]] uint64_t profile_id() const noexcept { return _profile_id; }
     virtual ~Command() noexcept = default;
     virtual void accept(CommandVisitor &visitor) const noexcept = 0;
     virtual void accept(MutableCommandVisitor &visitor) noexcept = 0;

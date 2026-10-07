@@ -4,6 +4,33 @@
 #include <luisa/core/magic_enum.h>
 #include <luisa/runtime/device.h>
 #include <luisa/runtime/stream.h>
+#include <luisa/runtime/profile.h>
+#include <atomic>
+#include <chrono>
+#ifdef _WIN32
+#include <Windows.h>
+#endif
+
+namespace luisa::compute::profile {
+namespace { std::atomic<Sink *> profile_observer{}; }
+void set_sink(Sink *s) noexcept { profile_observer.store(s, std::memory_order_release); }
+Sink *sink() noexcept { return profile_observer.load(std::memory_order_acquire); }
+uint64_t clock_ns() noexcept {
+#ifdef _WIN32
+    static auto frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart; }();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return static_cast<uint64_t>(static_cast<long double>(t.QuadPart) * 1.0e9L / frequency);
+#else
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+uint64_t command_created(uint32_t tag) noexcept {
+    if (auto s = sink(); s && s->enabled()) { return s->command(tag); }
+    return 0;
+}
+}
 
 namespace luisa::compute {
 
@@ -12,6 +39,7 @@ Stream Device::create_stream(StreamTag stream_tag) noexcept {
 }
 
 void Stream::_dispatch(CommandList &&list) noexcept {
+    auto profile_scope = profile::Scope{"runtime.dispatch", 0, handle()};
     _check_is_valid();
     if (!list.empty()) {
 #ifndef NDEBUG
